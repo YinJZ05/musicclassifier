@@ -1,0 +1,27 @@
+# QQ音乐歌单处理器配置
+
+qq_music:
+  # QQ音乐 Cookie（登录后从浏览器获取）
+  cookie: ""
+  # QQ号（可选，用于获取个人歌单）
+  qq_number: ""
+  # 请求超时时间（秒）
+  timeout: 30
+  # 请求间隔（秒），避免被限流
+  request_interval: 1.0
+
+classifier:
+  # 分类规则文件路径（留空使用内置规则）
+  rules_file: ""
+
+export:
+  # 默认导出目录
+  output_dir: "output"
+  # 默认导出格式: csv / json / excel
+  default_format: "csv"
+
+logging:
+  # 日志级别: DEBUG / INFO / WARNING / ERROR
+  level: "INFO"
+  # 日志文件路径（留空则只输出到控制台）
+  file: ""
