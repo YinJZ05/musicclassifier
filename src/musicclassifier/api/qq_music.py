@@ -32,12 +32,22 @@ DEFAULT_HEADERS = {
 
 
 class QQMusicAPI:
-    """QQ音乐 API 客户端"""
+    """QQ音乐 API 客户端
 
-    def __init__(self, cookie: str = "", timeout: float = 30, request_interval: float = 1.0):
-        self.cookie = cookie
+    支持 QQ 登录和微信登录两种方式，通过 Cookie 鉴权。
+    """
+
+    def __init__(
+        self,
+        cookie: str = "",
+        timeout: float = 30,
+        request_interval: float = 1.0,
+        login_type: str = "auto",
+    ):
+        self.cookie = cookie.strip().replace("\n", "").replace("\r", "")
         self.timeout = timeout
         self.request_interval = request_interval
+        self.login_type = login_type  # "qq" / "wechat" / "auto"
         self._last_request_time: float = 0
 
     @classmethod
@@ -48,7 +58,66 @@ class QQMusicAPI:
             cookie=settings.qq_music.cookie,
             timeout=settings.qq_music.timeout,
             request_interval=settings.qq_music.request_interval,
+            login_type=settings.qq_music.login_type,
         )
+
+    # ────────────────────────── 登录检测 ──────────────────────────
+
+    def detect_login_type(self) -> str:
+        """从 Cookie 自动检测登录类型
+
+        Returns:
+            "qq" 或 "wechat"
+        """
+        if self.login_type in ("qq", "wechat"):
+            return self.login_type
+
+        # 自动检测：微信登录的 Cookie 中包含 wxuin
+        if "wxuin" in self.cookie:
+            logger.info("检测到微信登录")
+            return "wechat"
+        logger.info("检测到 QQ 登录")
+        return "qq"
+
+    def extract_uin_from_cookie(self) -> str:
+        """从 Cookie 中提取用户标识 (uin)
+
+        QQ 登录: 提取 uin=xxx
+        微信登录: 提取 wxuin=xxx
+
+        Returns:
+            用户标识字符串
+        """
+        import re
+
+        login = self.detect_login_type()
+
+        if login == "wechat":
+            # 微信登录：wxuin=xxx
+            match = re.search(r'wxuin=(\d+)', self.cookie)
+            if match:
+                return match.group(1)
+        else:
+            # QQ 登录：uin=oXXXX 或 uin=XXXXX
+            match = re.search(r'uin=o?(\d+)', self.cookie)
+            if match:
+                return match.group(1)
+
+        return ""
+
+    def get_login_info(self) -> dict[str, str]:
+        """获取当前登录信息摘要
+
+        Returns:
+            包含 login_type, uin 的字典
+        """
+        login = self.detect_login_type()
+        uin = self.extract_uin_from_cookie()
+        return {
+            "login_type": login,
+            "login_type_display": "微信登录" if login == "wechat" else "QQ 登录",
+            "uin": uin,
+        }
 
     def _get_headers(self) -> dict[str, str]:
         """获取请求头"""
@@ -131,21 +200,33 @@ class QQMusicAPI:
             songs=songs,
         )
 
-    def get_user_playlists(self, qq_number: str) -> list[dict[str, Any]]:
+    def get_user_playlists(self, uin: str = "") -> list[dict[str, Any]]:
         """获取用户创建/收藏的歌单列表
 
+        同时支持 QQ 登录和微信登录。如未传入 uin，会自动从 Cookie 提取。
+
         Args:
-            qq_number: 用户 QQ 号
+            uin: 用户标识（QQ号 或 微信uin），留空自动提取
 
         Returns:
             歌单基础信息列表
         """
+        if not uin:
+            uin = self.extract_uin_from_cookie()
+            if not uin:
+                logger.warning("无法从 Cookie 中提取用户标识，请手动传入 QQ 号或微信 uin")
+                return []
+
+        login = self.detect_login_type()
+        logger.info(f"获取歌单列表 (登录方式: {login}, uin: {uin})")
+
+        # 方式一：通用接口（QQ/微信均可尝试）
         req_data = {
             "req_0": {
                 "module": "music.srfDissInfo.aiDissInfo",
                 "method": "uniform_get_Ede",
                 "param": {
-                    "uin": qq_number,
+                    "uin": uin,
                     "is_query_fav": 1,
                 },
             }
@@ -153,6 +234,29 @@ class QQMusicAPI:
 
         data = self._post_request(U_URL, req_data)
 
+        playlists = self._parse_playlist_list(data)
+
+        # 方式二：如果方式一没结果，尝试备用接口
+        if not playlists:
+            logger.info("主接口未返回数据，尝试备用接口...")
+            req_data_alt = {
+                "req_0": {
+                    "module": "musichall.song_list_server",
+                    "method": "GetSongList",
+                    "param": {
+                        "uin": uin,
+                        "start": 0,
+                        "size": 200,
+                    },
+                }
+            }
+            data_alt = self._post_request(U_URL, req_data_alt)
+            playlists = self._parse_playlist_list_alt(data_alt)
+
+        return playlists
+
+    def _parse_playlist_list(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """解析主接口返回的歌单列表"""
         try:
             disslist = data["req_0"]["data"]["mymusic"]
         except (KeyError, TypeError):
@@ -165,7 +269,62 @@ class QQMusicAPI:
                 "name": item.get("title", "未知歌单"),
                 "song_count": item.get("subtitle", 0),
             })
+        return playlists
 
+    def _parse_playlist_list_alt(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """解析备用接口返回的歌单列表"""
+        try:
+            disslist = data["req_0"]["data"]["v_playlist"]
+        except (KeyError, TypeError):
+            disslist = []
+
+        playlists = []
+        for item in disslist:
+            playlists.append({
+                "id": str(item.get("tid", item.get("dissid", ""))),
+                "name": item.get("diss_name", item.get("title", "未知歌单")),
+                "song_count": item.get("song_cnt", item.get("subtitle", 0)),
+            })
+        return playlists
+
+    def fetch_all_playlists(
+        self,
+        qq_number: str,
+        on_progress: Any = None,
+    ) -> list[Playlist]:
+        """一次性获取用户所有歌单的详细信息
+
+        先获取歌单列表，再逐个拉取歌单详情（含歌曲）。
+
+        Args:
+            qq_number: 用户 QQ 号
+            on_progress: 可选的进度回调 fn(current, total, playlist_name)
+
+        Returns:
+            所有歌单的 Playlist 列表
+        """
+        playlist_infos = self.get_user_playlists(qq_number)
+        if not playlist_infos:
+            logger.warning(f"未获取到 QQ {qq_number} 的歌单")
+            return []
+
+        total = len(playlist_infos)
+        logger.info(f"共发现 {total} 个歌单，开始逐个获取详情...")
+
+        playlists: list[Playlist] = []
+        for i, info in enumerate(playlist_infos, 1):
+            pid = info["id"]
+            name = info["name"]
+            if on_progress:
+                on_progress(i, total, name)
+            try:
+                pl = self.get_playlist_detail(int(pid))
+                playlists.append(pl)
+                logger.info(f"[{i}/{total}] ✓ {pl.name} ({pl.song_count} 首)")
+            except Exception as e:
+                logger.error(f"[{i}/{total}] ✗ {name} (id={pid}): {e}")
+
+        logger.info(f"获取完成: 成功 {len(playlists)}/{total} 个歌单")
         return playlists
 
     def search_songs(self, keyword: str, page: int = 1, page_size: int = 20) -> list[Song]:
@@ -203,6 +362,20 @@ class QQMusicAPI:
 
     # ────────────────────────── 内部方法 ──────────────────────────
 
+    # QQ音乐流派 ID → 名称映射
+    GENRE_MAP: dict[int, str] = {
+        1: "流行", 2: "摇滚", 3: "民谣", 4: "电子", 5: "爵士",
+        6: "古典", 7: "R&B", 8: "说唱", 9: "轻音乐", 10: "乡村",
+        11: "蓝调", 14: "世界音乐", 15: "拉丁", 19: "新世纪",
+        20: "古风", 21: "后摇", 22: "Bossa Nova",
+    }
+
+    # QQ音乐语言 ID → 名称映射
+    LANGUAGE_MAP: dict[int, str] = {
+        0: "华语", 1: "英语", 2: "韩语", 3: "日语", 4: "粤语",
+        5: "其他", 6: "纯音乐",
+    }
+
     @staticmethod
     def _parse_song(raw: dict[str, Any]) -> Song:
         """解析原始歌曲数据为 Song 模型"""
@@ -211,12 +384,21 @@ class QQMusicAPI:
 
         album_info = raw.get("album", {})
 
+        # genre 和 language 可能是 int ID，转为字符串名称
+        genre_raw = raw.get("genre", "")
+        if isinstance(genre_raw, int):
+            genre_raw = QQMusicAPI.GENRE_MAP.get(genre_raw, str(genre_raw))
+        
+        language_raw = raw.get("language", "")
+        if isinstance(language_raw, int):
+            language_raw = QQMusicAPI.LANGUAGE_MAP.get(language_raw, str(language_raw))
+
         return Song(
-            mid=raw.get("mid", raw.get("songmid", "")),
+            mid=str(raw.get("mid", raw.get("songmid", ""))),
             name=raw.get("name", raw.get("songname", "未知")),
             artists=artist_names,
             album=album_info.get("name", raw.get("albumname", "")),
             duration=raw.get("interval", 0),
-            genre=raw.get("genre", ""),
-            language=raw.get("language", ""),
+            genre=str(genre_raw),
+            language=str(language_raw),
         )

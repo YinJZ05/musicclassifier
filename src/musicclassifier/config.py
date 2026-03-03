@@ -16,6 +16,7 @@ class QQMusicConfig(BaseModel):
     """QQ音乐相关配置"""
     cookie: str = ""
     qq_number: str = ""
+    login_type: str = "auto"  # "qq" / "wechat" / "auto"（自动检测）
     timeout: float = 30
     request_interval: float = 1.0
 

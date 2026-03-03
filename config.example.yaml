@@ -3,8 +3,10 @@
 qq_music:
   # QQ音乐 Cookie（登录后从浏览器获取）
   cookie: ""
-  # QQ号（可选，用于获取个人歌单）
+  # QQ号（可选，用于获取个人歌单，微信登录可留空）
   qq_number: ""
+  # 登录方式: auto / qq / wechat（auto 自动根据 Cookie 检测）
+  login_type: "auto"
   # 请求超时时间（秒）
   timeout: 30
   # 请求间隔（秒），避免被限流

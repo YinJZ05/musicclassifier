@@ -23,6 +23,8 @@ dependencies = [
     "loguru>=0.7",
     "openpyxl>=3.1",
     "rich>=13.0",
+    "streamlit>=1.35",
+    "plotly>=5.20",
 ]
 
 [project.optional-dependencies]
