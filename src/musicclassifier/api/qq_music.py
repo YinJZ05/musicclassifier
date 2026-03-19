@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-import asyncio
+import json
+import re
 import time
 from typing import Any
 
@@ -88,8 +89,6 @@ class QQMusicAPI:
         Returns:
             用户标识字符串
         """
-        import re
-
         login = self.detect_login_type()
 
         if login == "wechat":
@@ -118,6 +117,17 @@ class QQMusicAPI:
             "login_type_display": "微信登录" if login == "wechat" else "QQ 登录",
             "uin": uin,
         }
+
+    def _extract_cookie_value(self, key: str) -> str:
+        m = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", self.cookie)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _calc_g_tk(skey: str) -> int:
+        h = 5381
+        for c in skey:
+            h += (h << 5) + ord(c)
+        return h & 0x7FFFFFFF
 
     def _get_headers(self) -> dict[str, str]:
         """获取请求头"""
@@ -163,8 +173,6 @@ class QQMusicAPI:
         Returns:
             Playlist 对象
         """
-        url = f"{BASE_URL}/splcloud/fcgi-bin/fcg_get_diss_by_tag.fcg"
-
         # 使用新版 musicu 接口
         req_data = {
             "req_0": {
@@ -253,38 +261,121 @@ class QQMusicAPI:
             data_alt = self._post_request(U_URL, req_data_alt)
             playlists = self._parse_playlist_list_alt(data_alt)
 
-        return playlists
+        # 方式三：网页侧兜底（适合接口字段变更时）
+        if not playlists:
+            logger.info("备用接口未返回数据，尝试网页兜底解析...")
+            playlists = self._get_user_playlists_from_web(uin)
+
+        # 方式四：稳定老接口兜底（已验证在当前登录链路可用）
+        if not playlists:
+            logger.info("网页兜底未返回数据，尝试老接口获取歌单...")
+            playlists = self._get_user_playlists_legacy(uin)
+
+        # 去重 + 清洗
+        seen: set[str] = set()
+        cleaned: list[dict[str, Any]] = []
+        for p in playlists:
+            pid = str(p.get("id", "")).strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            cleaned.append({
+                "id": pid,
+                "name": str(p.get("name", "未知歌单") or "未知歌单"),
+                "song_count": int(p.get("song_count", 0) or 0),
+            })
+
+        logger.info(f"歌单列表获取完成: {len(cleaned)} 个")
+        return cleaned
 
     def _parse_playlist_list(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """解析主接口返回的歌单列表"""
-        try:
-            disslist = data["req_0"]["data"]["mymusic"]
-        except (KeyError, TypeError):
-            disslist = []
-
-        playlists = []
-        for item in disslist:
-            playlists.append({
-                "id": item.get("dissid", ""),
-                "name": item.get("title", "未知歌单"),
-                "song_count": item.get("subtitle", 0),
-            })
-        return playlists
+        return self._extract_playlists_generic(data)
 
     def _parse_playlist_list_alt(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """解析备用接口返回的歌单列表"""
-        try:
-            disslist = data["req_0"]["data"]["v_playlist"]
-        except (KeyError, TypeError):
-            disslist = []
+        return self._extract_playlists_generic(data)
 
-        playlists = []
+    def _extract_playlists_generic(self, data: Any) -> list[dict[str, Any]]:
+        """从任意嵌套响应中提取歌单字段，适配接口字段漂移。"""
+        playlists: list[dict[str, Any]] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                # 常见歌单键位：dissid/tid + title/diss_name
+                pid = node.get("dissid") or node.get("tid") or node.get("id")
+                name = node.get("title") or node.get("diss_name") or node.get("name")
+                if pid and name:
+                    playlists.append({
+                        "id": str(pid),
+                        "name": str(name),
+                        "song_count": node.get("song_cnt", node.get("subtitle", node.get("song_count", 0))),
+                    })
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(data)
+        return playlists
+
+    def _get_user_playlists_from_web(self, uin: str) -> list[dict[str, Any]]:
+        """从用户歌单页面提取歌单信息（接口失效时兜底）。"""
+        url = f"https://y.qq.com/n/ryqq/user/{uin}/playlist"
+        self._throttle()
+        with httpx.Client(timeout=self.timeout, headers=self._get_headers(), follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            html = resp.text
+
+        # Next.js 页面数据
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+        if not m:
+            return []
+
+        try:
+            payload = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            return []
+
+        return self._extract_playlists_generic(payload)
+
+    def _get_user_playlists_legacy(self, uin: str) -> list[dict[str, Any]]:
+        """使用 c.y.qq.com 老接口获取用户歌单。"""
+        skey = self._extract_cookie_value("p_skey") or self._extract_cookie_value("skey")
+        g_tk = self._calc_g_tk(skey) if skey else 5381
+
+        url = f"{BASE_URL}/rsc/fcgi-bin/fcg_user_created_diss"
+        params = {
+            "hostuin": uin,
+            "sin": 0,
+            "size": 200,
+            "r": str(time.time()),
+            "g_tk": g_tk,
+            "format": "json",
+        }
+
+        self._throttle()
+        with httpx.Client(timeout=self.timeout, headers=self._get_headers(), follow_redirects=True) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        disslist = data.get("data", {}).get("disslist", []) if isinstance(data, dict) else []
+        playlists: list[dict[str, Any]] = []
         for item in disslist:
+            pid = item.get("tid") or item.get("dissid") or item.get("dirid")
+            name = item.get("diss_name") or item.get("title") or item.get("name")
+            if not pid or not name:
+                continue
             playlists.append({
-                "id": str(item.get("tid", item.get("dissid", ""))),
-                "name": item.get("diss_name", item.get("title", "未知歌单")),
-                "song_count": item.get("song_cnt", item.get("subtitle", 0)),
+                "id": str(pid),
+                "name": str(name),
+                "song_count": int(item.get("song_cnt", item.get("songnum", 0)) or 0),
             })
+
+        logger.info(f"老接口返回歌单: {len(playlists)} 个")
         return playlists
 
     def fetch_all_playlists(

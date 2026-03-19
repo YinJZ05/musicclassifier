@@ -57,6 +57,15 @@ musicclassifier export --playlist-id 123456789 --format csv
 musicclassifier stats --playlist-id 123456789
 ```
 
+也支持直接粘贴歌单链接或分享文本（无需手动提取 ID）：
+
+```bash
+musicclassifier fetch "https://y.qq.com/n/ryqq/playlist/8032497163"
+musicclassifier export "分享里包含 8032497163 这个歌单" --format csv
+```
+
+Web UI 中同样支持一次粘贴多个歌单 ID/链接/分享文本进行批量读取。
+
 ## 项目结构
 
 ```

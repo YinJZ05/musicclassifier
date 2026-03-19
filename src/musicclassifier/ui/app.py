@@ -11,6 +11,8 @@ import time
 
 import streamlit as st
 
+from musicclassifier.utils.helpers import extract_playlist_ids
+
 st.set_page_config(
     page_title="🎵 QQ音乐歌单处理器",
     page_icon="🎵",
@@ -89,10 +91,11 @@ def show_login_page():
                 st.rerun()
         st.divider()
 
-    # ── 三种登录方式 ──
-    tab_qq, tab_cookie, tab_public = st.tabs([
+    # ── 四种登录方式 ──
+    tab_qq, tab_wechat, tab_cookie, tab_public = st.tabs([
         "🐧 QQ 扫码登录",
-        "📋 粘贴 Cookie（QQ/微信通用）",
+        "💬 微信登录QQ音乐",
+        "📋 粘贴 Cookie",
         "🔗 公开歌单（免登录）",
     ])
 
@@ -102,14 +105,29 @@ def show_login_page():
         st.caption("适合 QQ 用户，扫码后自动获取认证")
 
         if st.button("📱 生成二维码", type="primary", key="gen_qr", use_container_width=True):
-            _do_qr_login()
+            _do_qr_login("qq")
 
-    # ──── Tab 2: 粘贴 Cookie ────
+    # ──── Tab 2: 微信扫码 ────
+    with tab_wechat:
+        st.markdown("**用手机微信扫码登录 QQ 音乐**")
+        st.caption("将生成微信扫码通道二维码，请使用微信扫描（不要用QQ扫描）")
+
+        if st.button("💬 生成微信二维码", type="primary", key="gen_qr_wechat", use_container_width=True):
+            _do_qr_login("wechat")
+
+    # ──── Tab 3: 粘贴 Cookie ────
     with tab_cookie:
-        st.markdown("**粘贴浏览器 Cookie（QQ 和微信登录均适用）**")
+        st.markdown("**粘贴 QQ音乐 Cookie（QQ / 微信登录均支持）**")
         st.caption(
             "浏览器登录 [y.qq.com](https://y.qq.com) → F12 → Network → "
             "找任意 `musicu.fcg` 请求 → 复制 Cookie"
+        )
+        cookie_login_type = st.radio(
+            "登录方式",
+            ["qq", "wechat"],
+            format_func=lambda x: "QQ" if x == "qq" else "微信",
+            horizontal=True,
+            key="cookie_login_type",
         )
         cookie_input = st.text_area(
             "Cookie",
@@ -119,57 +137,76 @@ def show_login_page():
         )
         if st.button("🔑 登录", type="primary", key="cookie_login", use_container_width=True):
             if cookie_input.strip():
-                _do_login(cookie_input.strip(), "cookie")
+                _do_login(cookie_input.strip(), cookie_login_type)
             else:
                 st.warning("请粘贴 Cookie")
 
-    # ──── Tab 3: 公开歌单 ────
+    # ──── Tab 4: 公开歌单 ────
     with tab_public:
-        st.markdown("**无需登录，直接输入公开歌单 ID 或链接**")
-        st.caption("仅限公开歌单，无法获取个人歌单列表")
-        url_input = st.text_input(
-            "歌单 ID 或链接",
-            placeholder="例: 8032497163 或 https://y.qq.com/n/ryqq/playlist/8032497163",
+        st.markdown("**无需登录，直接粘贴公开歌单 ID / 链接 / 分享文本**")
+        st.caption("支持一次输入多个歌单（每行一个或一段分享文案）")
+        url_input = st.text_area(
+            "歌单 ID / 链接 / 分享文案",
+            height=120,
+            placeholder=(
+                "例:\n"
+                "8032497163\n"
+                "https://y.qq.com/n/ryqq/playlist/8032497163\n"
+                "分享文案里包含数字 ID 也可识别"
+            ),
         )
         if st.button("📥 读取歌单", type="primary", key="public_fetch", use_container_width=True):
             if url_input.strip():
-                _do_public_fetch(url_input.strip())
+                _fetch_playlists_from_text("", url_input.strip(), is_public=True)
             else:
                 st.warning("请输入歌单 ID 或链接")
 
 
 def _do_login(cookie: str, login_type: str):
-    """执行登录：保存会话 → 加载歌单列表 → 切到主页"""
+    """执行登录：保存会话 → 切到主页 → 在主页自动加载歌单"""
     from musicclassifier.auth.session import save_session
 
     save_session(cookie, login_type)
     st.session_state["cookie"] = cookie
     st.session_state["login_type"] = login_type
     st.session_state["logged_in"] = True
+    st.session_state["playlist_infos"] = st.session_state.get("playlist_infos", [])
+    st.session_state["pending_auto_load"] = True
 
-    # 自动加载歌单列表
-    with st.spinner("正在加载你的歌单..."):
-        try:
-            playlists = auto_load_playlists(cookie)
-            st.session_state["playlist_infos"] = playlists
-        except Exception as e:
-            st.session_state["playlist_infos"] = []
-            st.warning(f"歌单列表加载失败: {e}")
+    # 检查 Cookie 内容
+    api = get_api(cookie)
+    uin = api.extract_uin_from_cookie()
+    login_info = api.detect_login_type()
+    st.session_state["detected_uin"] = uin
+    st.session_state["detected_login"] = login_info
+
+    if not uin:
+        # UIN 提取失败，不阻塞，进主页让用户手动输入
+        st.session_state["playlist_infos"] = []
+        st.session_state["pending_auto_load"] = False
+        st.session_state["login_error"] = (
+            "Cookie 中未找到用户标识 (uin)，可能 Cookie 不完整。\n"
+            "请在下一页手动输入 QQ 号来加载歌单。"
+        )
+        st.rerun()
+        return
 
     st.rerun()
 
 
-def _do_qr_login():
-    """QQ 扫码登录流程"""
+def _do_qr_login(login_mode: str = "qq"):
+    """扫码登录流程（QQ / 微信）"""
     from musicclassifier.auth.qq_login import (
         QQQRLogin,
+        WechatQRLogin,
         LOGIN_STATUS_SUCCESS,
         LOGIN_STATUS_EXPIRED,
         LOGIN_STATUS_SCANNED,
+        LOGIN_STATUS_ERROR,
     )
 
     try:
-        login = QQQRLogin()
+        login = WechatQRLogin() if login_mode == "wechat" else QQQRLogin()
         qr_bytes = login.get_qrcode()
     except Exception as e:
         st.error(f"二维码生成失败: {e}")
@@ -178,13 +215,14 @@ def _do_qr_login():
     # 显示二维码
     col_l, col_c, col_r = st.columns([1, 2, 1])
     with col_c:
-        st.image(qr_bytes, caption="用手机 QQ 扫描此二维码", width=280)
+        caption = "用手机微信扫描此二维码" if login_mode == "wechat" else "用手机 QQ 扫描此二维码"
+        st.image(qr_bytes, caption=caption, width=280)
 
     # 轮询登录状态
     status_box = st.empty()
     progress = st.progress(0)
 
-    max_wait = 120  # 秒
+    max_wait = 240  # 秒
     interval = 2.0
     steps = int(max_wait / interval)
 
@@ -196,7 +234,7 @@ def _do_qr_login():
             status_box.success("✅ 登录成功！")
             progress.empty()
             login.close()
-            _do_login(message, "qq")
+            _do_login(message, login_mode)
             return
 
         elif status == LOGIN_STATUS_EXPIRED:
@@ -206,7 +244,12 @@ def _do_qr_login():
             return
 
         elif status == LOGIN_STATUS_SCANNED:
-            status_box.info("📱 已扫码，请在手机上点击确认")
+            status_box.info(f"📱 {message}")
+        elif status == LOGIN_STATUS_ERROR:
+            status_box.error(f"❌ 登录状态异常: {message}")
+            progress.empty()
+            login.close()
+            return
         else:
             status_box.info(f"⏳ {message}")
 
@@ -215,33 +258,6 @@ def _do_qr_login():
     status_box.warning("⏰ 登录超时，请重试")
     progress.empty()
     login.close()
-
-
-def _do_public_fetch(input_text: str):
-    """公开歌单免登录获取"""
-    import re
-
-    match = re.search(r"(\d{5,})", input_text)
-    if not match:
-        st.error("无法识别歌单 ID，请输入数字 ID 或完整链接")
-        return
-
-    playlist_id = int(match.group(1))
-    api = get_api("")  # 无 cookie
-
-    try:
-        with st.spinner(f"正在获取歌单 {playlist_id}..."):
-            playlist = api.get_playlist_detail(playlist_id)
-        st.session_state["logged_in"] = True
-        st.session_state["cookie"] = ""
-        st.session_state["login_type"] = "public"
-        st.session_state["all_playlists"] = [playlist]
-        st.session_state["playlist_infos"] = [
-            {"id": playlist.id, "name": playlist.name, "song_count": playlist.song_count}
-        ]
-        st.rerun()
-    except Exception as e:
-        st.error(f"获取失败: {e}")
 
 
 # ══════════════════════════════════════════════════
@@ -279,6 +295,39 @@ def show_main_page():
 
     st.divider()
 
+    # ── 显示登录状态信息 ──
+    login_error = st.session_state.pop("login_error", None)
+    detected_uin = st.session_state.get("detected_uin", "")
+
+    # 登录后首次进入主页时，自动加载一次歌单列表，避免在登录按钮动作里卡住页面。
+    should_auto_load = (
+        st.session_state.get("pending_auto_load", False)
+        and login_type != "public"
+        and bool(cookie)
+    )
+    if should_auto_load:
+        with st.spinner("正在自动加载歌单列表..."):
+            try:
+                playlists = auto_load_playlists(cookie)
+                st.session_state["playlist_infos"] = playlists
+                if not playlists and detected_uin:
+                    st.session_state["login_error"] = (
+                        f"已识别用户 {detected_uin}，但未获取到歌单列表。\n"
+                        "可能 Cookie 已过期或接口返回为空。"
+                    )
+            except Exception as e:
+                st.session_state["playlist_infos"] = []
+                st.session_state["login_error"] = f"歌单列表加载失败: {e}"
+            finally:
+                st.session_state["pending_auto_load"] = False
+        st.rerun()
+
+    if login_error:
+        st.warning(f"⚠️ {login_error}")
+
+    if detected_uin:
+        st.caption(f"👤 当前用户: {detected_uin}")
+
     playlist_infos = st.session_state.get("playlist_infos", [])
 
     # ── 如果有歌单列表但尚未加载详情 ──
@@ -296,20 +345,70 @@ def show_main_page():
             if st.button("📦 读取全部歌单详情", type="primary", use_container_width=True):
                 _fetch_all_playlists(cookie, playlist_infos)
         with col2:
-            selected_id = st.text_input("或输入歌单 ID 单独读取", placeholder="歌单 ID")
+            selected_id = st.text_input("或输入歌单 ID / 链接读取", placeholder="歌单 ID 或链接")
             if selected_id:
                 if st.button("📥 读取", use_container_width=True):
-                    _fetch_single_playlist(cookie, selected_id)
+                    _fetch_playlists_from_text(cookie, selected_id, is_public=False)
 
     # ── 已加载详情后，进入操作面板 ──
     elif "all_playlists" in st.session_state:
         show_operations_panel()
 
+    # ── 没有歌单列表：提供手动输入和重试 ──
     else:
-        st.warning("未找到歌单数据，请重新登录")
+        st.info("📝 未自动获取到歌单列表，你可以：")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.markdown("**方式 1：输入 QQ 号手动加载**")
+            manual_uin = st.text_input(
+                "QQ 号", placeholder="输入你的 QQ 号", key="manual_uin",
+            )
+            if st.button("📋 加载歌单列表", type="primary", use_container_width=True, key="load_by_uin"):
+                if manual_uin.strip():
+                    _load_playlists_by_uin(cookie, manual_uin.strip())
+                else:
+                    st.warning("请输入 QQ 号")
+
+        with col_b:
+            st.markdown("**方式 2：粘贴歌单 ID / 链接 / 分享文本**")
+            direct_id = st.text_area(
+                "歌单 ID / 链接 / 分享文本",
+                placeholder="支持一次输入多个歌单（每行一个）",
+                key="direct_playlist_id",
+                height=120,
+            )
+            if st.button("📥 读取歌单", type="primary", use_container_width=True, key="direct_fetch"):
+                if direct_id.strip():
+                    _fetch_playlists_from_text(cookie, direct_id.strip(), is_public=False)
+                else:
+                    st.warning("请输入歌单 ID")
+
+        st.divider()
         if st.button("🔄 重新登录"):
-            st.session_state.pop("logged_in", None)
+            from musicclassifier.auth.session import delete_session
+            delete_session()
+            for key in ["logged_in", "cookie", "login_type", "playlist_infos",
+                        "all_playlists", "detected_uin", "detected_login"]:
+                st.session_state.pop(key, None)
             st.rerun()
+
+
+def _load_playlists_by_uin(cookie: str, uin: str):
+    """通过手动输入的 QQ 号加载歌单列表"""
+    api = get_api(cookie)
+    with st.spinner(f"正在加载 {uin} 的歌单..."):
+        try:
+            playlists = api.get_user_playlists(uin)
+            if playlists:
+                st.session_state["playlist_infos"] = playlists
+                st.session_state["detected_uin"] = uin
+                st.rerun()
+            else:
+                st.error(f"未获取到 {uin} 的歌单，请确认 QQ 号是否正确")
+        except Exception as e:
+            st.error(f"加载失败: {e}")
 
 
 def _fetch_all_playlists(cookie: str, infos: list):
@@ -341,28 +440,52 @@ def _fetch_all_playlists(cookie: str, infos: list):
     st.rerun()
 
 
-def _fetch_single_playlist(cookie: str, playlist_id_str: str):
-    """读取单个歌单"""
-    import re
-
-    match = re.search(r"(\d{5,})", playlist_id_str)
-    if not match:
-        st.error("请输入有效的歌单 ID")
+def _fetch_playlists_from_text(cookie: str, input_text: str, is_public: bool):
+    """从输入文本中解析并读取一个或多个歌单。"""
+    ids = extract_playlist_ids(input_text)
+    if not ids:
+        st.error("无法识别歌单 ID，请输入 ID、链接或分享文本")
         return
 
     api = get_api(cookie)
-    try:
-        with st.spinner("读取中..."):
-            pl = api.get_playlist_detail(int(match.group(1)))
-        st.session_state["all_playlists"] = [pl]
-        st.rerun()
-    except Exception as e:
-        st.error(f"读取失败: {e}")
+    playlists = []
+    failed = []
+    progress = st.progress(0, text="开始读取...")
 
+    for i, pid in enumerate(ids):
+        progress.progress((i + 1) / len(ids), text=f"[{i + 1}/{len(ids)}] 读取歌单 {pid}")
+        try:
+            playlists.append(api.get_playlist_detail(pid))
+        except Exception as e:
+            failed.append(f"{pid}: {e}")
 
-# ══════════════════════════════════════════════════
-# 操作面板（歌单已加载后）
-# ══════════════════════════════════════════════════
+    progress.empty()
+
+    if not playlists:
+        st.error("读取失败：未成功获取任何歌单")
+        if failed:
+            with st.expander(f"查看失败详情（{len(failed)}）"):
+                for item in failed:
+                    st.write(f"- {item}")
+        return
+
+    st.session_state["all_playlists"] = playlists
+    st.session_state["playlist_infos"] = [
+        {"id": p.id, "name": p.name, "song_count": p.song_count} for p in playlists
+    ]
+
+    if is_public:
+        st.session_state["logged_in"] = True
+        st.session_state["cookie"] = ""
+        st.session_state["login_type"] = "public"
+
+    st.success(f"✅ 成功读取 {len(playlists)}/{len(ids)} 个歌单")
+    if failed:
+        with st.expander(f"⚠️ {len(failed)} 个读取失败"):
+            for item in failed:
+                st.write(f"- {item}")
+    st.rerun()
+
 
 def show_operations_panel():
     import pandas as pd

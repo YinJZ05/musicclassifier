@@ -16,7 +16,7 @@ from musicclassifier.config import load_settings
 from musicclassifier.processors.classifier import SongClassifier
 from musicclassifier.processors.dedup import deduplicate
 from musicclassifier.processors.exporter import export_songs
-from musicclassifier.utils.helpers import setup_logging
+from musicclassifier.utils.helpers import extract_playlist_ids, setup_logging
 
 app = typer.Typer(
     name="musicclassifier",
@@ -24,6 +24,14 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+def _resolve_playlist_id(raw: str) -> int:
+    """从 ID、链接或分享文本中解析歌单 ID。"""
+    ids = extract_playlist_ids(raw)
+    if not ids:
+        raise typer.BadParameter("无法识别歌单 ID，请输入数字 ID、链接或分享文本")
+    return ids[0]
 
 
 def _get_api(config_path: str | None) -> QQMusicAPI:
@@ -40,11 +48,12 @@ def _get_api(config_path: str | None) -> QQMusicAPI:
 
 @app.command()
 def fetch(
-    playlist_id: int = typer.Argument(..., help="歌单 ID"),
+    playlist: str = typer.Argument(..., help="歌单 ID / 链接 / 分享文本"),
     config: str | None = typer.Option(None, "--config", "-c", help="配置文件路径"),
 ) -> None:
     """获取并展示歌单内容"""
     api = _get_api(config)
+    playlist_id = _resolve_playlist_id(playlist)
 
     console.print(f"[bold]正在获取歌单 {playlist_id} ...[/bold]")
     playlist = api.get_playlist_detail(playlist_id)
@@ -80,7 +89,7 @@ def list_playlists(
 
     info = api.get_login_info()
     console.print(f"[dim]登录方式: {info['login_type_display']}  uin: {qq}[/dim]")
-    console.print(f"[bold]正在获取歌单列表...[/bold]")
+    console.print("[bold]正在获取歌单列表...[/bold]")
     playlists = api.get_user_playlists(qq)
 
     if not playlists:
@@ -182,7 +191,7 @@ def fetch_all(
             console.print(f"\n[bold cyan]  汇总文件: {summary_path} ({len(all_songs)} 首)[/bold cyan]")
 
         # 打印统计
-        console.print(f"\n[bold]📊 统计:[/bold]")
+        console.print("\n[bold]📊 统计:[/bold]")
         console.print(f"  歌单数: {len(playlists)}")
         console.print(f"  总歌曲: {len(all_songs)} 首")
         unique_artists = set()
@@ -193,12 +202,13 @@ def fetch_all(
 
 @app.command()
 def classify(
-    playlist_id: int = typer.Argument(..., help="歌单 ID"),
+    playlist: str = typer.Argument(..., help="歌单 ID / 链接 / 分享文本"),
     by: str = typer.Option("genre", "--by", "-b", help="分类维度: genre / language"),
     config: str | None = typer.Option(None, "--config", "-c", help="配置文件路径"),
 ) -> None:
     """对歌单中的歌曲进行自动分类"""
     api = _get_api(config)
+    playlist_id = _resolve_playlist_id(playlist)
 
     console.print(f"[bold]正在获取歌单 {playlist_id} ...[/bold]")
     playlist = api.get_playlist_detail(playlist_id)
@@ -217,11 +227,12 @@ def classify(
 
 @app.command()
 def dedup(
-    playlist_id: int = typer.Argument(..., help="歌单 ID"),
+    playlist: str = typer.Argument(..., help="歌单 ID / 链接 / 分享文本"),
     config: str | None = typer.Option(None, "--config", "-c", help="配置文件路径"),
 ) -> None:
     """检测歌单中的重复歌曲"""
     api = _get_api(config)
+    playlist_id = _resolve_playlist_id(playlist)
 
     console.print(f"[bold]正在获取歌单 {playlist_id} ...[/bold]")
     playlist = api.get_playlist_detail(playlist_id)
@@ -240,7 +251,7 @@ def dedup(
 
 @app.command()
 def export(
-    playlist_id: int = typer.Argument(..., help="歌单 ID"),
+    playlist: str = typer.Argument(..., help="歌单 ID / 链接 / 分享文本"),
     format: str = typer.Option("csv", "--format", "-f", help="导出格式: csv / json / excel"),
     output: str = typer.Option("", "--output", "-o", help="输出文件路径（默认自动生成）"),
     config: str | None = typer.Option(None, "--config", "-c", help="配置文件路径"),
@@ -248,6 +259,7 @@ def export(
     """导出歌单为文件"""
     settings = load_settings(config)
     api = _get_api(config)
+    playlist_id = _resolve_playlist_id(playlist)
 
     console.print(f"[bold]正在获取歌单 {playlist_id} ...[/bold]")
     playlist = api.get_playlist_detail(playlist_id)
@@ -264,11 +276,12 @@ def export(
 
 @app.command()
 def stats(
-    playlist_id: int = typer.Argument(..., help="歌单 ID"),
+    playlist: str = typer.Argument(..., help="歌单 ID / 链接 / 分享文本"),
     config: str | None = typer.Option(None, "--config", "-c", help="配置文件路径"),
 ) -> None:
     """查看歌单统计信息"""
     api = _get_api(config)
+    playlist_id = _resolve_playlist_id(playlist)
 
     console.print(f"[bold]正在获取歌单 {playlist_id} ...[/bold]")
     playlist = api.get_playlist_detail(playlist_id)
